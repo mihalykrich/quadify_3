@@ -64,7 +64,6 @@ def set_has_seen_ready():
     except Exception as e:
         print(f"Could not create first-run flag file: {e}")
 
-
 def is_first_run():
     netconfigured = os.path.exists('/data/configuration/netconfigured')
     network_configs = glob.glob('/data/configuration/system_controller/network/*.json')
@@ -103,12 +102,10 @@ def show_gif_loop(gif_path, stop_condition, display_manager, logger):
             # Always paste onto a blank image of the required size
             background = Image.new(display_manager.oled.mode, required_size)
             frame_converted = frame.convert(display_manager.oled.mode)
-            # If frame size is smaller (common in GIFs), paste it at (0,0)
             background.paste(frame_converted, (0,0))
             display_manager.oled.display(background)
             frame_duration = frame.info.get('duration', 100) / 1000.0
             time.sleep(frame_duration)
-
 
 def main():
     # --- Logging ---
@@ -155,12 +152,14 @@ def main():
         
     # --- Choose which ready GIF to show (based on our own flag, not Wi-Fi config) ---
     if not has_seen_ready():
-        ready_gif_path = display_config.get('ready_new_path', 'ready_new.gif')
-        logger.info("Showing 'ready_new.gif' for new user.")
+        ready_intro_path = display_config.get('ready_gif_path', 'ready.gif')
+        ready_loop_path = display_config.get('ready_loop_path', 'ready_loop.gif')
+        logger.info("Showing 'ready.gif' (intro pan) for new user, then looping static.")
         is_first_time_user = True
     else:
-        ready_gif_path = display_config.get('ready_gif_path', 'ready.gif')
-        logger.info("Showing 'ready.gif' for returning user.")
+        ready_intro_path = display_config.get('ready_gif_path', 'ready.gif')
+        ready_loop_path = display_config.get('ready_loop_path', 'ready_loop.gif')
+        logger.info("Showing 'ready.gif' (intro pan) for returning user, then looping static.")
         is_first_time_user = False
 
     import smbus2
@@ -170,13 +169,11 @@ def main():
     
     try:
         bus = smbus2.SMBus(1)
-        # Turn LED8 off (clear bit 0)
         current = bus.read_byte_data(MCP23017_ADDRESS, MCP23017_GPIOA)
         bus.write_byte_data(MCP23017_ADDRESS, MCP23017_GPIOA, current & 0b11111110)
         bus.close()
     except Exception as e:
         print(f"Error turning off LED8: {e}")
-
 
     # --- Startup Logo ---
     logger.info("Displaying startup logo...")
@@ -196,6 +193,30 @@ def main():
     volumio_host = volumio_cfg.get('host', 'localhost')
     volumio_port = volumio_cfg.get('port', 3000)
     volumio_listener = VolumioListener(host=volumio_host, port=volumio_port)
+
+    # On Volumio state change: set events, also handle ready_stop_event if playing
+    def on_state_changed(sender, state):
+        logger.info(f"Volumio state changed: {state}")
+        if state.get('status') == 'play' and not ready_stop_event.is_set():
+            logger.info("Detected playback start! Exiting ready screen.")
+            ready_stop_event.set()
+        if state.get('status') in ['play', 'stop', 'pause', 'unknown']:
+            logger.info("Volumio is considered ready now.")
+            volumio_ready_event.set()
+            try:
+                volumio_listener.state_changed.disconnect(on_state_changed)
+            except Exception:
+                pass
+
+    volumio_listener.state_changed.connect(on_state_changed)
+
+    # Minimum loading duration
+    def set_min_loading_event():
+        time.sleep(MIN_LOADING_DURATION)
+        min_loading_event.set()
+        logger.info("Minimum loading duration has elapsed.")
+
+    threading.Thread(target=set_min_loading_event, daemon=True).start()
 
     # Loading GIF thread
     def show_loading():
@@ -223,56 +244,7 @@ def main():
 
     threading.Thread(target=show_loading, daemon=True).start()
 
-    # Minimum loading duration
-    def set_min_loading_event():
-        time.sleep(MIN_LOADING_DURATION)
-        min_loading_event.set()
-        logger.info("Minimum loading duration has elapsed.")
-
-    threading.Thread(target=set_min_loading_event, daemon=True).start()
-
-    # On Volumio state change: set events, also handle ready_stop_event if playing
-    def on_state_changed(sender, state):
-        logger.info(f"Volumio state changed: {state}")
-        if state.get('status') == 'play' and not ready_stop_event.is_set():
-            logger.info("Detected playback start! Exiting ready screen.")
-            ready_stop_event.set()
-        if state.get('status') in ['play', 'stop', 'pause', 'unknown']:
-            logger.info("Volumio is considered ready now.")
-            volumio_ready_event.set()
-            try:
-                volumio_listener.state_changed.disconnect(on_state_changed)
-            except Exception:
-                pass
-
-    volumio_listener.state_changed.connect(on_state_changed)
-
-    # Ready GIF thread (uses chosen GIF path!)
-    def show_ready_gif_until_event(stop_event, gif_path):
-        try:
-            image = Image.open(gif_path)
-            if not getattr(image, "is_animated", False):
-                logger.warning("Ready GIF is not animated.")
-                return
-        except Exception as e:
-            logger.error(f"Failed to load ready GIF: {e}")
-            return
-        logger.info(f"Displaying ready GIF ({gif_path}) until event.")
-        while not stop_event.is_set():
-            for frame in ImageSequence.Iterator(image):
-                if stop_event.is_set():
-                    return
-                display_manager.oled.display(frame.convert(display_manager.oled.mode))
-                frame_duration = frame.info.get('duration', 100) / 1000.0
-                time.sleep(frame_duration)
-
-    # DummyModeManager and initial rotary input handler, for before full UI setup
-    class DummyModeManager:
-        def get_mode(self):
-            return None
-
-    mode_manager_placeholder = DummyModeManager()
-
+    # ---------- READY BUTTON HANDLER FOR GIF LOOP ----------
     def on_button_press_inner():
         if not ready_stop_event.is_set():
             ready_stop_event.set()
@@ -290,6 +262,7 @@ def main():
         long_press_threshold=2.5
     )
     threading.Thread(target=rotary_control.start, daemon=True).start()
+    # -------------------------------------------------------
 
     # --- Wait for both loading events then run Ready GIF ---
     logger.info("Waiting for Volumio readiness & min load time.")
@@ -297,17 +270,47 @@ def main():
     min_loading_event.wait()
     logger.info("Volumio is ready & min loading time passed, proceeding to ready GIF.")
 
+    # --- Ready GIF handling ---
+    def play_gif_once(display_manager, gif_path):
+        try:
+            image = Image.open(gif_path)
+            if not getattr(image, "is_animated", False):
+                display_manager.oled.display(image.convert(display_manager.oled.mode))
+                return
+            for frame in ImageSequence.Iterator(image):
+                display_manager.oled.display(frame.convert(display_manager.oled.mode))
+                frame_duration = frame.info.get('duration', 100) / 1000.0
+                time.sleep(frame_duration)
+        except Exception as e:
+            logger.error(f"Failed to play GIF {gif_path}: {e}")
+
+    def show_ready_gif_until_event(stop_event, gif_path):
+        try:
+            image = Image.open(gif_path)
+            if not getattr(image, "is_animated", False):
+                display_manager.oled.display(image.convert(display_manager.oled.mode))
+                return
+            while not stop_event.is_set():
+                for frame in ImageSequence.Iterator(image):
+                    if stop_event.is_set():
+                        return
+                    display_manager.oled.display(frame.convert(display_manager.oled.mode))
+                    frame_duration = frame.info.get('duration', 100) / 1000.0
+                    time.sleep(frame_duration)
+        except Exception as e:
+            logger.error(f"Failed to loop GIF {gif_path}: {e}")
+
+    play_gif_once(display_manager, ready_intro_path)
     threading.Thread(
         target=show_ready_gif_until_event,
-        args=(ready_stop_event, ready_gif_path),
+        args=(ready_stop_event, ready_loop_path),
         daemon=True
     ).start()
     ready_stop_event.wait()
-    logger.info("Ready GIF exited, continuing to UI startup.")
+    logger.info("Ready loop GIF exited, continuing to UI startup.")
 
     if is_first_time_user:
         set_has_seen_ready()
-
 
     # --- Now the main UI, ModeManager, screens, etc ---
     clock_config = config.get('clock', {})
@@ -331,7 +334,7 @@ def main():
     )
     manager_factory.setup_mode_manager()
     volumio_listener.mode_manager = mode_manager
-    
+
     mode_manager.trigger("to_menu")
     logger.info("Forced system into 'menu' mode after ready GIF.")
 
@@ -397,7 +400,6 @@ def main():
     def on_button_press_ui():
         current_mode = mode_manager.get_mode()
         if current_mode == 'clock':
-            # Use trigger to go to menu
             mode_manager.trigger("to_menu")
         elif current_mode == 'menu':
             mode_manager.menu_manager.select_item()
@@ -449,7 +451,6 @@ def main():
             mode_manager.exit_screensaver()
         else:
             logger.warning(f"Unhandled mode: {current_mode}; no button action performed.")
-
 
     def on_long_press_ui():
         current_mode = mode_manager.get_mode()
